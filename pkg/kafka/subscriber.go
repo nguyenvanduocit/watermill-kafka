@@ -78,6 +78,13 @@ type SubscriberConfig struct {
 
 	InitializeTopicDetails *sarama.TopicDetail
 
+	// If true, SubscribeInitialize won't wait for all partitions to be created across brokers.
+	// By default, SubscribeInitialize ensures the topic is ready for consumer operations before returning.
+	DoNotWaitForTopicCreation bool
+
+	// Timeout for waiting for topic creation.
+	WaitForTopicCreationTimeout time.Duration
+
 	// If true then each consumed message will be wrapped with Opentelemetry tracing, provided by otelsarama.
 	//
 	// Deprecated: pass OTELSaramaTracer to Tracer field instead.
@@ -103,6 +110,9 @@ func (c *SubscriberConfig) setDefaults() {
 	}
 	if c.Unmarshaler == nil {
 		c.Unmarshaler = DefaultMarshaler{}
+	}
+	if c.WaitForTopicCreationTimeout == 0 {
+		c.WaitForTopicCreationTimeout = 10 * time.Second
 	}
 }
 
@@ -635,6 +645,10 @@ ResendLoop:
 }
 
 func (s *Subscriber) SubscribeInitialize(topic string) (err error) {
+	return s.SubscribeInitializeWithContext(context.Background(), topic)
+}
+
+func (s *Subscriber) SubscribeInitializeWithContext(ctx context.Context, topic string) (err error) {
 	if s.config.InitializeTopicDetails == nil {
 		return errors.New("s.config.InitializeTopicDetails is empty, cannot SubscribeInitialize")
 	}
@@ -655,7 +669,124 @@ func (s *Subscriber) SubscribeInitialize(topic string) (err error) {
 
 	s.logger.Info("Created Kafka topic", watermill.LogFields{"topic": topic})
 
+	if !s.config.DoNotWaitForTopicCreation {
+		ctx, cancel := context.WithTimeout(ctx, s.config.WaitForTopicCreationTimeout)
+		defer cancel()
+
+		if err := s.waitForTopicCreation(ctx, clusterAdmin, topic); err != nil {
+			return errors.Wrap(err, "failed to wait for topic creation")
+		}
+	}
+
 	return nil
+}
+
+func (s *Subscriber) waitForTopicCreation(ctx context.Context, clusterAdmin sarama.ClusterAdmin, topic string) error {
+	logFields := watermill.LogFields{"topic": topic}
+	s.logger.Debug("Waiting for topic creation to be confirmed", logFields)
+
+	pollInterval := 500 * time.Millisecond
+	attempt := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			return errors.Wrap(ctx.Err(), "context cancelled while waiting for topic creation")
+		default:
+		}
+
+		topics, err := clusterAdmin.ListTopics()
+		if err != nil {
+			s.logger.Debug("Failed to list topics", logFields.Add(watermill.LogFields{
+				"attempt": attempt + 1,
+				"error":   err.Error(),
+			}))
+		} else {
+			if topicDetail, exists := topics[topic]; exists {
+				if s.verifyPartitionsReady(clusterAdmin, topic, topicDetail, logFields, attempt) {
+					s.logger.Debug("Topic and partitions creation confirmed", logFields.Add(watermill.LogFields{
+						"attempt": attempt + 1,
+					}))
+					return nil
+				}
+			}
+		}
+
+		s.logger.Debug("Topic not yet available, retrying", logFields.Add(watermill.LogFields{
+			"attempt":  attempt + 1,
+			"retry_in": pollInterval.String(),
+		}))
+
+		timer := time.NewTimer(pollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.Wrap(ctx.Err(), "context cancelled while waiting for topic creation")
+		case <-timer.C:
+			// Continue to next attempt
+		}
+
+		attempt++
+	}
+}
+
+func (s *Subscriber) verifyPartitionsReady(clusterAdmin sarama.ClusterAdmin, topic string, topicDetail sarama.TopicDetail, logFields watermill.LogFields, attempt int) bool {
+	metadata, err := clusterAdmin.DescribeTopics([]string{topic})
+	if err != nil {
+		s.logger.Debug("Failed to describe topic", logFields.Add(watermill.LogFields{
+			"attempt": attempt + 1,
+			"error":   err.Error(),
+		}))
+		return false
+	}
+
+	if len(metadata) == 0 {
+		s.logger.Debug("No topic metadata returned", logFields.Add(watermill.LogFields{
+			"attempt": attempt + 1,
+		}))
+		return false
+	}
+
+	topicMeta := metadata[0]
+	if !errors.Is(topicMeta.Err, sarama.ErrNoError) {
+		s.logger.Debug("Topic metadata contains error", logFields.Add(watermill.LogFields{
+			"attempt": attempt + 1,
+			"error":   topicMeta.Err.Error(),
+		}))
+		return false
+	}
+
+	// Check that all expected partitions exist and have leaders
+	expectedPartitions := topicDetail.NumPartitions
+	if int32(len(topicMeta.Partitions)) < expectedPartitions {
+		s.logger.Debug("Not all partitions available yet", logFields.Add(watermill.LogFields{
+			"attempt":              attempt + 1,
+			"expected_partitions":  expectedPartitions,
+			"available_partitions": len(topicMeta.Partitions),
+		}))
+		return false
+	}
+
+	// Verify each partition has a leader
+	for _, partition := range topicMeta.Partitions {
+		if !errors.Is(partition.Err, sarama.ErrNoError) {
+			s.logger.Debug("Partition has error", logFields.Add(watermill.LogFields{
+				"attempt":   attempt + 1,
+				"partition": partition.ID,
+				"error":     partition.Err.Error(),
+			}))
+			return false
+		}
+		if partition.Leader == -1 {
+			s.logger.Debug("Partition has no leader", logFields.Add(watermill.LogFields{
+				"attempt":   attempt + 1,
+				"partition": partition.ID,
+			}))
+			return false
+		}
+	}
+
+	return true
 }
 
 type PartitionOffset map[int32]int64
