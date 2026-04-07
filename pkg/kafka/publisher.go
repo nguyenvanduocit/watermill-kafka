@@ -1,24 +1,24 @@
 package kafka
 
 import (
-	"time"
+	"context"
 
-	"github.com/IBM/sarama"
 	"github.com/pkg/errors"
+	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/message"
 )
 
 type Publisher struct {
-	config   PublisherConfig
-	producer sarama.SyncProducer
-	logger   watermill.LoggerAdapter
+	config PublisherConfig
+	client *kgo.Client
+	logger watermill.LoggerAdapter
 
 	closed bool
 }
 
-// NewPublisher creates a new Kafka Publisher.
+// NewPublisher creates a new Kafka Publisher backed by franz-go.
 func NewPublisher(
 	config PublisherConfig,
 	logger watermill.LoggerAdapter,
@@ -33,23 +33,26 @@ func NewPublisher(
 		logger = watermill.NopLogger{}
 	}
 
-	producer, err := sarama.NewSyncProducer(config.Brokers, config.OverwriteSaramaConfig)
+	opts := []kgo.Opt{
+		kgo.SeedBrokers(config.Brokers...),
+		kgo.RequiredAcks(kgo.AllISRAcks()),
+		kgo.RecordRetries(10),
+		// Allow the broker to auto-create topics on first produce (if broker
+		// has auto.create.topics.enable=true). Without this, franz-go returns
+		// UNKNOWN_TOPIC_OR_PARTITION immediately instead of triggering creation.
+		kgo.AllowAutoTopicCreation(),
+	}
+	opts = append(opts, config.KgoOpts...)
+
+	client, err := kgo.NewClient(opts...)
 	if err != nil {
 		return nil, errors.Wrap(err, "cannot create Kafka producer")
 	}
 
-	if config.OTELEnabled && config.Tracer == nil {
-		config.Tracer = NewOTELSaramaTracer()
-	}
-
-	if config.Tracer != nil {
-		producer = config.Tracer.WrapSyncProducer(config.OverwriteSaramaConfig, producer)
-	}
-
 	return &Publisher{
-		config:   config,
-		producer: producer,
-		logger:   logger,
+		config: config,
+		client: client,
+		logger: logger,
 	}, nil
 }
 
@@ -60,21 +63,12 @@ type PublisherConfig struct {
 	// Marshaler is used to marshal messages from Watermill format into Kafka format.
 	Marshaler Marshaler
 
-	// OverwriteSaramaConfig holds additional sarama settings.
-	OverwriteSaramaConfig *sarama.Config
-
-	// If true then each sent message will be wrapped with Opentelemetry tracing, provided by otelsarama.
-	OTELEnabled bool
-
-	// Tracer is used to trace Kafka messages.
-	// If nil, then no tracing will be used.
-	Tracer SaramaTracer
+	// KgoOpts are additional franz-go client options for the producer.
+	// Use this to customize producer behavior (e.g., custom partitioner, compression).
+	KgoOpts []kgo.Opt
 }
 
 func (c *PublisherConfig) setDefaults() {
-	if c.OverwriteSaramaConfig == nil {
-		c.OverwriteSaramaConfig = DefaultSaramaSyncPublisherConfig()
-	}
 	if c.Marshaler == nil {
 		c.Marshaler = DefaultMarshaler{}
 	}
@@ -91,21 +85,10 @@ func (c PublisherConfig) Validate() error {
 	return nil
 }
 
-func DefaultSaramaSyncPublisherConfig() *sarama.Config {
-	config := sarama.NewConfig()
-
-	config.Producer.Retry.Max = 10
-	config.Producer.Return.Successes = true
-	config.Metadata.Retry.Backoff = time.Second * 2
-	config.ClientID = "watermill"
-
-	return config
-}
-
 // Publish publishes message to Kafka.
 //
-// Publish is blocking and wait for ack from Kafka.
-// When one of messages delivery fails - function is interrupted.
+// Publish is blocking and waits for ack from Kafka.
+// When one of the messages delivery fails, the function returns immediately.
 func (p *Publisher) Publish(topic string, msgs ...*message.Message) error {
 	if p.closed {
 		return errors.New("publisher closed")
@@ -118,18 +101,20 @@ func (p *Publisher) Publish(topic string, msgs ...*message.Message) error {
 		logFields["message_uuid"] = msg.UUID
 		p.logger.Trace("Sending message to Kafka", logFields)
 
-		kafkaMsg, err := p.config.Marshaler.Marshal(topic, msg)
+		record, err := p.config.Marshaler.Marshal(topic, msg)
 		if err != nil {
 			return errors.Wrapf(err, "cannot marshal message %s", msg.UUID)
 		}
 
-		partition, offset, err := p.producer.SendMessage(kafkaMsg)
-		if err != nil {
+		// ProduceSync blocks until the broker acks the record.
+		results := p.client.ProduceSync(context.Background(), record)
+		if err := results.FirstErr(); err != nil {
 			return errors.Wrapf(err, "cannot produce message %s", msg.UUID)
 		}
 
-		logFields["kafka_partition"] = partition
-		logFields["kafka_partition_offset"] = offset
+		r := results[0].Record
+		logFields["kafka_partition"] = r.Partition
+		logFields["kafka_partition_offset"] = r.Offset
 
 		p.logger.Trace("Message sent to Kafka", logFields)
 	}
@@ -143,9 +128,7 @@ func (p *Publisher) Close() error {
 	}
 	p.closed = true
 
-	if err := p.producer.Close(); err != nil {
-		return errors.Wrap(err, "cannot close Kafka producer")
-	}
+	p.client.Close()
 
 	return nil
 }

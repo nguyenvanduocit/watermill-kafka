@@ -11,11 +11,11 @@ import (
 )
 
 func init() {
-	// Set GOMAXPROCS to double the number of CPUs
 	runtime.GOMAXPROCS(runtime.GOMAXPROCS(0) * 2)
 }
 
 func TestPublishSubscribe_stress(t *testing.T) {
+	skipIfNoKafka(t)
 	tests.TestPubSubStressTest(
 		t,
 		tests.Features{
@@ -30,6 +30,7 @@ func TestPublishSubscribe_stress(t *testing.T) {
 }
 
 func TestPublishSubscribe_ordered_stress(t *testing.T) {
+	skipIfNoKafka(t)
 	tests.TestPubSubStressTest(
 		t,
 		tests.Features{

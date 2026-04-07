@@ -3,15 +3,14 @@ package kafka_test
 import (
 	"testing"
 
-	"github.com/IBM/sarama"
-
 	"github.com/ThreeDotsLabs/watermill"
-	"github.com/ThreeDotsLabs/watermill-kafka/v3/pkg/kafka"
+	"github.com/nguyenvanduocit/watermill-kafka/v3/pkg/kafka"
 	"github.com/ThreeDotsLabs/watermill/message"
 	"github.com/ThreeDotsLabs/watermill/pubsub/tests"
 )
 
 func BenchmarkSubscriber(b *testing.B) {
+	skipIfNoKafka(b)
 	tests.BenchSubscriber(b, func(n int) (message.Publisher, message.Subscriber) {
 		logger := watermill.NopLogger{}
 
@@ -23,15 +22,12 @@ func BenchmarkSubscriber(b *testing.B) {
 			panic(err)
 		}
 
-		saramaConfig := kafka.DefaultSaramaSubscriberConfig()
-		saramaConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
-
 		subscriber, err := kafka.NewSubscriber(
 			kafka.SubscriberConfig{
-				Brokers:               kafkaBrokers(),
-				Unmarshaler:           kafka.DefaultMarshaler{},
-				OverwriteSaramaConfig: saramaConfig,
-				ConsumerGroup:         "test",
+				Brokers:           kafkaBrokers(),
+				Unmarshaler:       kafka.DefaultMarshaler{},
+				ConsumerGroup:     "test",
+				ConsumeFromOldest: true,
 			},
 			logger,
 		)

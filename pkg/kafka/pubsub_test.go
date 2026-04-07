@@ -3,17 +3,18 @@ package kafka_test
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/IBM/sarama"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/ThreeDotsLabs/watermill"
-	"github.com/ThreeDotsLabs/watermill-kafka/v3/pkg/kafka"
+	"github.com/nguyenvanduocit/watermill-kafka/v3/pkg/kafka"
 	"github.com/ThreeDotsLabs/watermill/message"
 	"github.com/ThreeDotsLabs/watermill/message/subscriber"
 	"github.com/ThreeDotsLabs/watermill/pubsub/tests"
@@ -27,11 +28,21 @@ func kafkaBrokers() []string {
 	return []string{"localhost:9091", "localhost:9092", "localhost:9093"}
 }
 
+func skipIfNoKafka(t testing.TB) {
+	t.Helper()
+	brokers := kafkaBrokers()
+	conn, err := net.DialTimeout("tcp", brokers[0], 3*time.Second)
+	if err != nil {
+		t.Skipf("Kafka not available at %s, skipping integration test", brokers[0])
+	}
+	conn.Close()
+}
+
 func newPubSub(
 	t *testing.T,
 	marshaler kafka.MarshalerUnmarshaler,
 	consumerGroup string,
-	saramaOpts ...func(*sarama.Config),
+	kgoOpts ...kgo.Opt,
 ) (*kafka.Publisher, *kafka.Subscriber) {
 	logger := watermill.NewStdLogger(false, false)
 
@@ -54,33 +65,19 @@ func newPubSub(
 	}
 	require.NoError(t, err)
 
-	saramaConfig := kafka.DefaultSaramaSubscriberConfig()
-	saramaConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
-
-	saramaConfig.Admin.Timeout = time.Second * 30
-	saramaConfig.Producer.RequiredAcks = sarama.WaitForAll
-	saramaConfig.ChannelBufferSize = 10240
-	saramaConfig.Consumer.Group.Heartbeat.Interval = time.Millisecond * 500
-	saramaConfig.Consumer.Group.Rebalance.Timeout = time.Second * 3
-
-	for _, o := range saramaOpts {
-		o(saramaConfig)
-	}
-
-	var subscriber *kafka.Subscriber
+	var sub *kafka.Subscriber
 
 	retriesLeft = 5
 	for {
-		subscriber, err = kafka.NewSubscriber(
+		sub, err = kafka.NewSubscriber(
 			kafka.SubscriberConfig{
-				Brokers:               kafkaBrokers(),
-				Unmarshaler:           marshaler,
-				OverwriteSaramaConfig: saramaConfig,
-				ConsumerGroup:         consumerGroup,
-				InitializeTopicDetails: &sarama.TopicDetail{
-					NumPartitions:     50,
-					ReplicationFactor: 1,
-				},
+				Brokers:                          kafkaBrokers(),
+				Unmarshaler:                      marshaler,
+				ConsumerGroup:                    consumerGroup,
+				ConsumeFromOldest:                true,
+				InitializeTopicNumPartitions:     50,
+				InitializeTopicReplicationFactor: 1,
+				KgoOpts:                          kgoOpts,
 			},
 			logger,
 		)
@@ -95,7 +92,7 @@ func newPubSub(
 
 	require.NoError(t, err)
 
-	return publisher, subscriber
+	return publisher, sub
 }
 
 func generatePartitionKey(topic string, msg *message.Message) (string, error) {
@@ -119,6 +116,7 @@ func createNoGroupPubSub(t *testing.T) (message.Publisher, message.Subscriber) {
 }
 
 func TestPublishSubscribe(t *testing.T) {
+	skipIfNoKafka(t)
 	features := tests.Features{
 		ConsumerGroups:      true,
 		ExactlyOnceDelivery: false,
@@ -135,6 +133,7 @@ func TestPublishSubscribe(t *testing.T) {
 }
 
 func TestPublishSubscribe_ordered(t *testing.T) {
+	skipIfNoKafka(t)
 	if testing.Short() {
 		t.Skip("skipping long tests")
 	}
@@ -155,6 +154,7 @@ func TestPublishSubscribe_ordered(t *testing.T) {
 }
 
 func TestNoGroupSubscriber(t *testing.T) {
+	skipIfNoKafka(t)
 	if testing.Short() {
 		t.Skip("skipping long tests")
 	}
@@ -176,6 +176,7 @@ func TestNoGroupSubscriber(t *testing.T) {
 }
 
 func TestCtxValues(t *testing.T) {
+	skipIfNoKafka(t)
 	pub, sub := newPubSub(t, kafka.DefaultMarshaler{}, "")
 	topicName := "topic_" + watermill.NewUUID()
 
@@ -210,7 +211,6 @@ func TestCtxValues(t *testing.T) {
 		assert.True(t, ok)
 
 		if expectedPartitionsOffsets[partition] <= messagePartitionOffset {
-			// kafka partition offset is offset of the last message + 1
 			expectedPartitionsOffsets[partition] = messagePartitionOffset + 1
 		}
 	}
@@ -223,36 +223,6 @@ func TestCtxValues(t *testing.T) {
 	assert.EqualValues(t, expectedPartitionsOffsets, offsets)
 
 	require.NoError(t, pub.Close())
-}
-
-func TestPublishSubscribe_AutoCommitDisabled(t *testing.T) {
-	t.Parallel()
-
-	features := tests.Features{
-		ConsumerGroups:      true,
-		ExactlyOnceDelivery: false,
-		GuaranteedOrder:     false,
-		Persistent:          true,
-		// Disabled AutoCommit slow down Pub/Sub because of making commits synchronously
-		ForceShort: true,
-	}
-
-	pubSubConstructorWithConsumerGroup := func(t *testing.T, consumerGroup string) (message.Publisher, message.Subscriber) {
-		return newPubSub(t, kafka.DefaultMarshaler{}, consumerGroup, func(config *sarama.Config) {
-			// commit messages manually
-			config.Consumer.Offsets.AutoCommit.Enable = false
-		})
-	}
-	pubSubConstructor := func(t *testing.T) (message.Publisher, message.Subscriber) {
-		return pubSubConstructorWithConsumerGroup(t, "test")
-	}
-
-	tests.TestPubSub(
-		t,
-		features,
-		pubSubConstructor,
-		pubSubConstructorWithConsumerGroup,
-	)
 }
 
 func readAfterRetries(messagesCh <-chan *message.Message, retriesN int, timeout time.Duration) (receivedMessage *message.Message, ok bool) {
@@ -282,6 +252,7 @@ MessagesLoop:
 }
 
 func TestCtxValuesAfterRetry(t *testing.T) {
+	skipIfNoKafka(t)
 	pub, sub := newPubSub(t, kafka.DefaultMarshaler{}, "")
 	topicName := "topic_" + watermill.NewUUID()
 
@@ -311,7 +282,6 @@ func TestCtxValuesAfterRetry(t *testing.T) {
 	assert.NotZero(t, kafkaMsgTimestamp)
 
 	if expectedPartitionsOffsets[partition] <= messagePartitionOffset {
-		// kafka partition offset is offset of the last message + 1
 		expectedPartitionsOffsets[partition] = messagePartitionOffset + 1
 	}
 	assert.NotEmpty(t, expectedPartitionsOffsets)

@@ -1,35 +1,37 @@
 package kafka
 
 import (
-	"github.com/IBM/sarama"
-	"github.com/dnwe/otelsarama"
+	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/plugin/kotel"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
 
-type SaramaTracer interface {
-	WrapConsumer(sarama.Consumer) sarama.Consumer
-	WrapPartitionConsumer(sarama.PartitionConsumer) sarama.PartitionConsumer
-	WrapConsumerGroupHandler(sarama.ConsumerGroupHandler) sarama.ConsumerGroupHandler
-	WrapSyncProducer(*sarama.Config, sarama.SyncProducer) sarama.SyncProducer
-}
+// NewKotelOpts builds franz-go hook options for OTel tracing and metrics.
+// Pass TracerProvider and/or MeterProvider; nil providers are skipped.
+//
+// Usage:
+//
+//	opts := kafka.NewKotelOpts(tp, mp)
+//	pub, _ := kafka.NewPublisher(kafka.PublisherConfig{
+//	    Brokers: brokers,
+//	    KgoOpts: opts,
+//	}, logger)
+func NewKotelOpts(tp trace.TracerProvider, mp metric.MeterProvider) []kgo.Opt {
+	var kotelOpts []kotel.Opt
 
-type OTELSaramaTracer struct{}
+	if tp != nil {
+		tracer := kotel.NewTracer(kotel.TracerProvider(tp))
+		kotelOpts = append(kotelOpts, kotel.WithTracer(tracer))
+	}
+	if mp != nil {
+		meter := kotel.NewMeter(kotel.MeterProvider(mp))
+		kotelOpts = append(kotelOpts, kotel.WithMeter(meter))
+	}
 
-func NewOTELSaramaTracer() SaramaTracer {
-	return OTELSaramaTracer{}
-}
+	service := kotel.NewKotel(kotelOpts...)
 
-func (t OTELSaramaTracer) WrapConsumer(c sarama.Consumer) sarama.Consumer {
-	return otelsarama.WrapConsumer(c)
-}
-
-func (t OTELSaramaTracer) WrapConsumerGroupHandler(h sarama.ConsumerGroupHandler) sarama.ConsumerGroupHandler {
-	return otelsarama.WrapConsumerGroupHandler(h)
-}
-
-func (t OTELSaramaTracer) WrapPartitionConsumer(pc sarama.PartitionConsumer) sarama.PartitionConsumer {
-	return otelsarama.WrapPartitionConsumer(pc)
-}
-
-func (t OTELSaramaTracer) WrapSyncProducer(cfg *sarama.Config, p sarama.SyncProducer) sarama.SyncProducer {
-	return otelsarama.WrapSyncProducer(cfg, p)
+	return []kgo.Opt{
+		kgo.WithHooks(service.Hooks()...),
+	}
 }
