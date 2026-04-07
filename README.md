@@ -1,38 +1,123 @@
-# Watermill Kafka Pub/Sub
-<img align="right" width="200" src="https://watermill.io/img/gopher.svg">
+# Watermill Kafka Pub/Sub (franz-go)
 
-[![CI Status](https://github.com/ThreeDotsLabs/watermill-kafka/actions/workflows/master.yml/badge.svg)](https://github.com/ThreeDotsLabs/watermill-kafka/actions/workflows/master.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/ThreeDotsLabs/watermill-kafka)](https://goreportcard.com/report/github.com/ThreeDotsLabs/watermill-kafka)
+Fork of [ThreeDotsLabs/watermill-kafka](https://github.com/ThreeDotsLabs/watermill-kafka) that replaces [IBM/sarama](https://github.com/IBM/sarama) with [twmb/franz-go](https://github.com/twmb/franz-go).
 
-This is Pub/Sub for the [Watermill](https://watermill.io/) project.
+## Why this fork?
 
+Sarama does not support the **cooperative rebalance protocol**. Every consumer group rebalance (rolling update, pod scale, etc.) causes a **full stop-the-world** pause across all consumers — all partitions are revoked and reassigned, even those unaffected by the change. In production with 6+ pods and 24 partitions, this creates 2,000–12,000 message backlogs per partition after each deployment.
 
-See [DEVELOPMENT.md](./DEVELOPMENT.md) for more information about running and testing.
+franz-go supports `CooperativeStickyBalancer` natively — only affected partitions move during rebalance, and unaffected consumers keep processing without interruption.
 
-Watermill is a Go library for working efficiently with message streams. It is intended
-for building event driven applications, enabling event sourcing, RPC over messages,
-sagas and basically whatever else comes to your mind. You can use conventional pub/sub
-implementations like Kafka or RabbitMQ, but also HTTP or MySQL binlog if that fits your use case.
+## What changed
 
-All Pub/Sub implementations can be found at [https://watermill.io/pubsubs/](https://watermill.io/pubsubs/).
+| | Sarama (upstream) | franz-go (this fork) |
+|--|---|---|
+| **Rebalance** | Eager only (Range/RoundRobin/Sticky) | **CooperativeSticky** (default) |
+| **Consumer model** | Callback (`ConsumerGroupHandler`) | Poll (`PollFetches`) |
+| **Producer** | `SyncProducer.SendMessage` | `Client.ProduceSync` |
+| **Config** | `*sarama.Config` struct | `[]kgo.Opt` functional options |
+| **Message type** | `ProducerMessage` + `ConsumerMessage` | `*kgo.Record` (unified) |
+| **OTel** | `otelsarama` wrapper | `kotel` hooks |
+| **Topic admin** | `sarama.ClusterAdmin` | `kadm.Client` |
+| **Code size** | ~1,800 lines | ~1,400 lines (-22%) |
 
-Documentation: https://watermill.io/
+## Installation
 
-Getting started guide: https://watermill.io/docs/getting-started/
+```bash
+go get github.com/nguyenvanduocit/watermill-kafka/v3
+```
 
-Issues: https://github.com/ThreeDotsLabs/watermill/issues
+## Usage
 
-## Contributing
+### Publisher
 
-All contributions are very much welcome. If you'd like to help with Watermill development,
-please see [open issues](https://github.com/ThreeDotsLabs/watermill/issues?utf8=%E2%9C%93&q=is%3Aissue+is%3Aopen+)
-and submit your pull request via GitHub.
+```go
+pub, err := kafka.NewPublisher(kafka.PublisherConfig{
+    Brokers: []string{"localhost:9092"},
+}, logger)
 
-## Support
+err = pub.Publish("my-topic", message.NewMessage(watermill.NewUUID(), []byte("hello")))
+```
 
-If you didn't find the answer to your question in [the documentation](https://watermill.io/), feel free to ask us directly!
+### Subscriber (consumer group)
 
-Please join us on the `#watermill` channel on the [Three Dots Labs Discord](https://discord.gg/QV6VFg4YQE).
+CooperativeStickyBalancer is enabled by default when `ConsumerGroup` is set.
+
+```go
+sub, err := kafka.NewSubscriber(kafka.SubscriberConfig{
+    Brokers:       []string{"localhost:9092"},
+    ConsumerGroup: "my-group",
+}, logger)
+
+messages, err := sub.Subscribe(ctx, "my-topic")
+```
+
+### Custom kgo options
+
+Use `KgoOpts` for advanced configuration (SASL, TLS, custom balancer, etc.):
+
+```go
+sub, err := kafka.NewSubscriber(kafka.SubscriberConfig{
+    Brokers:       []string{"localhost:9092"},
+    ConsumerGroup: "my-group",
+    KgoOpts: []kgo.Opt{
+        kgo.SASL(scram.Auth{User: "user", Pass: "pass"}.AsSHA256Mechanism()),
+        kgo.DialTLSConfig(&tls.Config{}),
+    },
+}, logger)
+```
+
+### Marshaler
+
+The marshaler interface uses `*kgo.Record` (not Sarama types):
+
+```go
+type Marshaler interface {
+    Marshal(topic string, msg *message.Message) (*kgo.Record, error)
+}
+
+type Unmarshaler interface {
+    Unmarshal(msg *kgo.Record) (*message.Message, error)
+}
+```
+
+`DefaultMarshaler` is used when no marshaler is specified.
+
+## Migration from upstream
+
+Replace import path and update config:
+
+```diff
+- import "github.com/ThreeDotsLabs/watermill-kafka/v3/pkg/kafka"
++ import "github.com/nguyenvanduocit/watermill-kafka/v3/pkg/kafka"
+
+  sub, err := kafka.NewSubscriber(kafka.SubscriberConfig{
+      Brokers:       brokers,
+      ConsumerGroup: group,
+-     OverwriteSaramaConfig: saramaCfg,
++     KgoOpts: []kgo.Opt{
++         // your custom options here
++     },
+  }, logger)
+```
+
+Key differences:
+- `OverwriteSaramaConfig` replaced by `KgoOpts []kgo.Opt`
+- `InitializeTopicDetails *sarama.TopicDetail` replaced by `InitializeTopicNumPartitions` + `InitializeTopicReplicationFactor`
+- `ConsumeFromOldest bool` replaces manual offset configuration
+- `SaramaTracer` interface removed — use `kotel` hooks via `KgoOpts`
+
+## Testing
+
+```bash
+# Unit tests (in-memory Kafka via kfake, no Docker needed)
+go test -race ./pkg/kafka/ -run kfake
+
+# Integration tests (requires Docker)
+docker compose up -d
+go test -race -v ./pkg/kafka/
+docker compose down
+```
 
 ## License
 
