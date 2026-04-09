@@ -393,7 +393,9 @@ ResendLoop:
 		case <-msg.Acked():
 			// MarkCommitRecords tells the auto-committer that this offset is safe to commit.
 			// Combined with AutoCommitMarks(), offsets are committed periodically.
-			client.MarkCommitRecords(record)
+			if client != nil {
+				client.MarkCommitRecords(record)
+			}
 			s.logger.Trace("Message Acked", receivedMsgLogFields)
 			break ResendLoop
 		case <-msg.Nacked():
