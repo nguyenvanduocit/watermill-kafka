@@ -264,6 +264,16 @@ func (s *Subscriber) consumeMessages(
 
 // pollLoop continuously polls Kafka for new records and processes them through
 // the Watermill message pipeline (unmarshal → send to output → wait for ack/nack).
+//
+// Records from different partitions are processed concurrently — one goroutine
+// per partition per poll iteration. Within a single partition, records are still
+// processed sequentially to preserve Kafka ordering guarantees.
+//
+// This matches the Sarama-based watermill-kafka subscriber behavior where each
+// partition gets its own consumePartition goroutine. The Watermill Router spawns
+// a new goroutine per message (router.go:670 — `go h.handleMessage`), so pushing
+// messages from multiple partitions concurrently lets the Router process them in
+// parallel rather than serializing on the single-goroutine EachRecord loop.
 func (s *Subscriber) pollLoop(
 	ctx context.Context,
 	client *kgo.Client,
@@ -295,17 +305,35 @@ func (s *Subscriber) pollLoop(
 			}
 		}
 
-		var processErr error
-		fetches.EachRecord(func(record *kgo.Record) {
-			if processErr != nil {
+		// Dispatch records to per-partition goroutines for concurrent processing.
+		// Each partition's records are processed sequentially (ordering preserved),
+		// but different partitions run in parallel.
+		var wg sync.WaitGroup
+		var errOnce sync.Once
+		var firstErr error
+
+		fetches.EachPartition(func(ftp kgo.FetchTopicPartition) {
+			records := ftp.Records
+			if len(records) == 0 {
 				return
 			}
-			if err := s.processRecord(ctx, client, record, output, logFields); err != nil {
-				processErr = err
-			}
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for _, record := range records {
+					if err := s.processRecord(ctx, client, record, output, logFields); err != nil {
+						errOnce.Do(func() { firstErr = err })
+						return
+					}
+				}
+			}()
 		})
-		if processErr != nil {
-			s.logger.Error("Error processing record, breaking poll loop", processErr, logFields)
+
+		wg.Wait()
+
+		if firstErr != nil {
+			s.logger.Error("Error processing record, breaking poll loop", firstErr, logFields)
 			return
 		}
 
